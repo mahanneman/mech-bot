@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: mahanneman-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mahanneman1.py --run
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
