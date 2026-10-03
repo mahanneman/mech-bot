@@ -1,0 +1,39 @@
+name: Mahan Neman Bot
+
+on:
+  schedule:
+    # هر ۶ ساعت یک بار روشن می‌شه
+    - cron: '0 */6 * * *'
+  workflow_dispatch:      # اجرای دستی از تب Actions
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355     # ~5 ساعت و 55 دقیقه
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          DATA_DIR:  ./data
+        run: |
+          timeout 21000 python mahanneman_bot.py || true
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name  "mahan-bot"
+          git config user.email "mahan-bot@users.noreply.github.com"
+          git add data/ 2>/dev/null || true
+          git add *.json 2>/dev/null || true
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+          git push || true
