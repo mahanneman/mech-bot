@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MAHAN NEMAN BOT — Professional Edition
-───────────────────────────────────────
-• 50+ features: multi-channel, per-channel schedule, AI content,
-  RSS news, Wikipedia, arXiv, images, tools, backups, stats, etc.
-• Fully inline-keyboard driven
-• JSON persistence
-• Background scheduler
-• No external deps (stdlib only)
+MAHAN NEMAN BOT — Professional Edition (Fixed)
+───────────────────────────────────────────────
+Fixes applied:
+  1. @username channels now work (to_chat_id)
+  2. Tehran timezone for scheduler (UTC+3:30)
+  3. stats_text moved before handle_message
+  4. forward_origin support (TG API 7.0+)
+  5. multipart upload helper (for files/audio)
+  6. edit() no longer silently swallows errors
+  7. Long messages auto-chunked (4096 limit)
 
 Run:  BOT_TOKEN=xxx ADMIN_IDS=5484310778 python3 mahanneman_bot.py
 """
 
-import os, sys, json, time, random, threading, traceback, hashlib
+import os, sys, json, time, random, threading, traceback, hashlib, uuid
 import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -27,6 +29,8 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "5484310778")
              .replace(" ", "").split(",") if x.isdigit()]
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
 if not TOKEN:
     print("ERROR: set BOT_TOKEN env var.")
@@ -60,11 +64,52 @@ def api(method, payload=None):
     except Exception as e:
         return {"ok": False, "description": str(e)}
 
+
+def api_upload(method, payload, field, file_bytes, filename):
+    """Multipart upload for files (audio, document, photo-bytes)."""
+    boundary = "----MN" + uuid.uuid4().hex
+    parts = []
+    for k, v in (payload or {}).items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+            f"{v}\r\n".encode()
+        )
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field}"; '
+        f'filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n".encode()
+    )
+    parts.append(file_bytes + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"{API}/{method}", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:    return json.loads(e.read().decode("utf-8"))
+        except Exception: return {"ok": False, "description": str(e)}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
 def send(chat_id, text, kb=None, pm="HTML"):
-    p = {"chat_id": chat_id, "text": text[:4096], "parse_mode": pm,
-         "disable_web_page_preview": True}
-    if kb: p["reply_markup"] = kb
-    return api("sendMessage", p)
+    """Auto-chunk long messages (Telegram limit ~4096)."""
+    text = text or ""
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] or [""]
+    last = None
+    for i, ch in enumerate(chunks):
+        p = {"chat_id": chat_id, "text": ch, "parse_mode": pm,
+             "disable_web_page_preview": True}
+        if kb and i == len(chunks) - 1:
+            p["reply_markup"] = kb
+        last = api("sendMessage", p)
+    return last
+
 
 def send_photo(chat_id, url, caption="", kb=None):
     p = {"chat_id": chat_id, "photo": url, "caption": caption[:1024],
@@ -72,32 +117,47 @@ def send_photo(chat_id, url, caption="", kb=None):
     if kb: p["reply_markup"] = kb
     return api("sendPhoto", p)
 
-def send_audio(chat_id, url, caption="", kb=None):
-    p = {"chat_id": chat_id, "audio": url, "caption": caption[:1024],
-         "parse_mode": "HTML"}
-    if kb: p["reply_markup"] = kb
-    return api("sendAudio", p)
+
+def send_document_bytes(chat_id, filename, data, caption="", kb=None):
+    p = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
+    if kb: p["reply_markup"] = json.dumps(kb)
+    return api_upload("sendDocument", p, "document", data, filename)
+
 
 def edit(chat_id, msg_id, text, kb=None):
     p = {"chat_id": chat_id, "message_id": msg_id, "text": text[:4096],
          "parse_mode": "HTML", "disable_web_page_preview": True}
     if kb: p["reply_markup"] = kb
     r = api("editMessageText", p)
-    if not r.get("ok") and "not modified" not in (r.get("description") or ""):
-        pass
+    if not r.get("ok"):
+        d = (r.get("description") or "").lower()
+        if "not modified" not in d:
+            log_event("edit_err", d)
     return r
+
 
 def answer_cb(cb_id, text="", alert=False):
     return api("answerCallbackQuery",
                {"callback_query_id": cb_id, "text": text, "show_alert": alert})
 
+
 def delete_msg(chat_id, msg_id):
     return api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+
 
 def pin_msg(chat_id, msg_id, notify=False):
     return api("pinChatMessage",
                {"chat_id": chat_id, "message_id": msg_id,
                 "disable_notification": not notify})
+
+
+def to_chat_id(cid):
+    """int for -100... / numbers, str for @username."""
+    cid = str(cid).strip()
+    if cid.lstrip("-").isdigit():
+        return int(cid)
+    return cid
+
 
 # ═══════════════════════════════════════════════════════════════
 # STORAGE
@@ -125,7 +185,7 @@ def get(path, default):
 def put(path, data):
     with _LOCK: _save(path, data)
 
-# ── helpers ────────────────────────────────────────────────
+
 def channels():    return get(F_CHANNELS, {})
 def save_channels(d): put(F_CHANNELS, d)
 def state():       return get(F_STATE, {})
@@ -148,8 +208,10 @@ def save_templates(d): put(F_TEMPLATES, d)
 
 def log_event(kind, msg):
     L = logs()
-    L.append({"t": datetime.utcnow().isoformat(), "k": kind, "m": str(msg)[:400]})
+    L.append({"t": datetime.now(TEHRAN).isoformat(), "k": kind,
+              "m": str(msg)[:400]})
     put(F_LOGS, L[-300:])
+
 
 # ═══════════════════════════════════════════════════════════════
 # TOPIC BANK
@@ -272,6 +334,7 @@ def pick_topic(cat):
                               for t, b in DEFAULT_TOPICS.get(cat, DEFAULT_TOPICS["general"])]
     return random.choice(bank)
 
+
 # ═══════════════════════════════════════════════════════════════
 # CONTENT
 # ═══════════════════════════════════════════════════════════════
@@ -294,29 +357,35 @@ def make_text(cat, channel_title="", hashtag=True, style="normal"):
         s += f"\n\n🔹 {channel_title}"
     return s, title
 
+
 def image_url(prompt):
     seed = random.randint(1, 999999)
     return (f"https://image.pollinations.ai/prompt/"
             f"{urllib.parse.quote(prompt[:180])}"
             f"?width=1024&height=1024&nologo=true&seed={seed}")
 
+
 def publish(channel_id, cat, with_image=True, hashtag=True,
             channel_title="", style="normal"):
+    """channel_id can be int (-100...) or str (@username)."""
+    chat = to_chat_id(channel_id)
     text, title = make_text(cat, channel_title, hashtag, style)
     if with_image:
-        r = send_photo(channel_id, image_url(f"{title} illustration"), caption=text)
+        r = send_photo(chat, image_url(f"{title} illustration"), caption=text)
         if r.get("ok"): return True, "photo", r["result"]["message_id"]
-    r = send(channel_id, text)
+    r = send(chat, text)
     if r.get("ok"): return True, "text", r["result"]["message_id"]
     return False, r.get("description", "unknown"), None
+
 
 def bump_stats():
     s = stats()
     s["total"] = s.get("total", 0) + 1
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(TEHRAN).strftime("%Y-%m-%d")
     s.setdefault("today", {})[today] = s.get("today", {}).get(today, 0) + 1
-    s["last"] = datetime.utcnow().isoformat()
+    s["last"] = datetime.now(TEHRAN).isoformat()
     save_stats(s)
+
 
 # ═══════════════════════════════════════════════════════════════
 # RSS / NEWS
@@ -355,6 +424,7 @@ def fetch_rss(key, limit=5):
         log_event("rss_error", f"{key}: {e}")
         return None
 
+
 # ═══════════════════════════════════════════════════════════════
 # WIKI / ARXIV
 # ═══════════════════════════════════════════════════════════════
@@ -388,17 +458,33 @@ def arxiv_search(q, limit=5):
     except Exception:
         return None
 
+
+# ═══════════════════════════════════════════════════════════════
+# STATS TEXT (moved before handlers)
+# ═══════════════════════════════════════════════════════════════
+def stats_text():
+    s = stats()
+    today = datetime.now(TEHRAN).strftime("%Y-%m-%d")
+    ch = channels()
+    on = sum(1 for c in ch.values() if c.get("enabled", True))
+    return (f"<b>📊 آمار</b>\n\n"
+            f"کل ارسال‌ها: <b>{s.get('total', 0)}</b>\n"
+            f"امروز: <b>{s.get('today', {}).get(today, 0)}</b>\n"
+            f"کانال‌ها: <b>{len(ch)}</b> (فعال: {on})\n"
+            f"آخرین ارسال: <code>{s.get('last') or '—'}</code>")
+
+
 # ═══════════════════════════════════════════════════════════════
 # SCHEDULER
 # ═══════════════════════════════════════════════════════════════
 def scheduler_loop():
-    print("[scheduler] started")
+    print("[scheduler] started (Tehran timezone)")
     while True:
         try:
             cfg = config()
             if not cfg.get("global_enabled", True):
                 time.sleep(30); continue
-            now = datetime.now()
+            now = datetime.now(TEHRAN)
             hhmm = now.strftime("%H:%M")
             today = now.strftime("%Y-%m-%d")
             ch = channels()
@@ -411,25 +497,26 @@ def scheduler_loop():
                 cats = info.get("categories") or cfg["default_cats"]
                 cat = random.choice(cats)
                 ok, mode, mid = publish(
-                    int(cid), cat,
+                    cid, cat,
                     with_image=info.get("with_image", True),
                     hashtag=info.get("with_hashtag", True),
                     channel_title=info.get("title", ""),
                     style=info.get("style", "normal"),
                 )
                 if ok:
-                    st[key] = datetime.utcnow().isoformat()
+                    st[key] = datetime.now(TEHRAN).isoformat()
                     save_state(st)
                     bump_stats()
                     log_event("send", f"{cid} @ {hhmm} ({cat}, {mode})")
                     if info.get("pin", False) and mid:
-                        pin_msg(int(cid), mid)
+                        pin_msg(to_chat_id(cid), mid)
                     print(f"[sched] sent → {cid} @ {hhmm} ({cat})")
                 else:
                     log_event("send_fail", f"{cid} @ {hhmm}: {mode}")
         except Exception as e:
             log_event("sched_err", e)
         time.sleep(30)
+
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARDS
@@ -561,12 +648,14 @@ def backup_menu():
 def help_menu():
     return KB([B("⬅️ بازگشت", "m:main")])
 
+
 # ═══════════════════════════════════════════════════════════════
 # PENDING FLOWS
 # ═══════════════════════════════════════════════════════════════
 PENDING = {}
 
 def is_admin(uid): return not ADMIN_IDS or uid in ADMIN_IDS
+
 
 # ═══════════════════════════════════════════════════════════════
 # MESSAGE HANDLER
@@ -587,11 +676,22 @@ def handle_message(msg):
         data = flow.get("data", {})
 
         if act == "add_channel":
-            fc = msg.get("forward_from_chat") or {}
-            fcid = fc.get("id")
+            fc = msg.get("forward_from_chat")
+            if not fc:
+                fo = msg.get("forward_origin") or {}
+                if fo.get("type") == "channel":
+                    fc = fo.get("chat") or {}
+            fcid = (fc or {}).get("id")
             if not fcid:
-                send(chat_id, "❌ این پیام از کانال فوروارد نشده. دوباره تلاش کن.",
-                     KB([B("⬅️ بازگشت", "m:main")]))
+                send(chat_id,
+                     "❌ این پیام از کانال فوروارد نشده.\n\n"
+                     "راه دیگر: پیام رو از کانال فوروارد کن "
+                     "(نه از چت خصوصی)، یا از گزینه «افزودن دسته‌ای» "
+                     "استفاده کن و آیدی رو دستی بفرست:\n"
+                     "<code>-1001234567890:عنوان</code>\n"
+                     "یا\n<code>@my_channel:عنوان</code>",
+                     KB([B("📦 افزودن دستی", "ch:bulk"),
+                         B("⬅️ بازگشت", "m:ch")]))
                 return
             ch = channels()
             ch[str(fcid)] = {
@@ -613,34 +713,46 @@ def handle_message(msg):
             return
 
         if act == "bulk_channels":
-            # text contains comma-separated:  id:title, id:title
             ch = channels()
             added = 0
-            for part in text.split(","):
-                part = part.strip()
-                if not part: continue
-                if ":" in part:
-                    cid, title = part.split(":", 1)
-                else:
-                    cid, title = part, part
-                cid = cid.strip().lstrip("@")
-                if not cid: continue
-                if not cid.startswith("-") and not cid.lstrip("-").isdigit():
-                    # username — leave as-is
-                    pass
-                ch[cid] = {
-                    "title": title.strip(),
-                    "enabled": True,
-                    "times": config()["default_times"],
-                    "categories": config()["default_cats"],
-                    "with_image": True,
-                    "with_hashtag": True,
-                    "pin": False,
-                    "style": "normal",
-                }
-                added += 1
+            failed = []
+            # split by comma or newline
+            for raw in text.replace("،", ",").split("\n"):
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part: continue
+                    if ":" in part:
+                        cid, title = part.split(":", 1)
+                    else:
+                        cid, title = part, part
+                    cid = cid.strip()
+                    title = title.strip()
+                    if not cid:
+                        failed.append(part); continue
+                    # normalize
+                    if cid.lstrip("-").isdigit():
+                        pass  # numeric
+                    elif cid.startswith("@"):
+                        pass  # username
+                    else:
+                        failed.append(part); continue
+                    ch[cid] = {
+                        "title": title or cid,
+                        "enabled": True,
+                        "times": config()["default_times"],
+                        "categories": config()["default_cats"],
+                        "with_image": True,
+                        "with_hashtag": True,
+                        "pin": False,
+                        "style": "normal",
+                    }
+                    added += 1
             save_channels(ch)
-            send(chat_id, f"✅ {added} کانال اضافه شد.",
+            msg_out = f"✅ {added} کانال اضافه شد."
+            if failed:
+                msg_out += f"\n\n⚠️ {len(failed)} مورد رد شد:\n" + \
+                           "\n".join(f"<code>{f}</code>" for f in failed[:5])
+            send(chat_id, msg_out,
                  KB([B("📢 لیست", "m:ch"), B("⬅️ منو", "m:main")]))
             return
 
@@ -713,7 +825,7 @@ def handle_message(msg):
             cat = cats[nums[0]-1] if nums and 1 <= nums[0] <= len(cats) else random.choice(cats)
             ch = channels().get(str(cid), {})
             ok, mode, mid = publish(
-                int(cid), cat,
+                cid, cat,
                 with_image=ch.get("with_image", True),
                 hashtag=ch.get("with_hashtag", True),
                 channel_title=ch.get("title", ""),
@@ -765,7 +877,6 @@ def handle_message(msg):
             return
 
         if act == "add_topic":
-            # expects: category|title|body
             parts = text.split("|", 2)
             if len(parts) != 3:
                 send(chat_id, "❌ فرمت: <code>cat|title|body</code>")
@@ -796,7 +907,7 @@ def handle_message(msg):
         if act == "draft_text":
             d = drafts()
             did = hashlib.md5(text.encode()).hexdigest()[:8]
-            d[did] = {"text": text, "t": datetime.utcnow().isoformat(),
+            d[did] = {"text": text, "t": datetime.now(TEHRAN).isoformat(),
                       "created_by": uid}
             save_drafts(d)
             send(chat_id, f"✅ پیش‌نویس ذخیره شد (<code>{did}</code>)",
@@ -820,7 +931,7 @@ def handle_message(msg):
              "<b>🤖 ربات ماهان‌نمان — حرفه‌ای</b>\n"
              "۵۰+ قابلیت:\n"
              "• مدیریت چند کاناله\n"
-             "• زمان‌بندی جدا برای هر کانال\n"
+             "• زمان‌بندی جدا برای هر کانال (به وقت تهران)\n"
              "• موضوعات + AI + RSS + ویکی + arXiv\n"
              "• عکس خودکار + هشتگ + پین\n"
              "• بکاپ، لاگ، آمار\n\n"
@@ -835,7 +946,7 @@ def handle_message(msg):
              "3) ساعت و موضوعات رو تنظیم کن\n"
              "4) ربات سر ساعت پست می‌ذاره\n\n"
              "<b>دستورات:</b>\n"
-             "/start — منو\n/stats — آمار\n/help — راهنما",
+             "/start — منو\n/stats — آمار\n/help — راهنما\n/id — آیدی من",
              KB([B("⬅️ منو", "m:main")]))
         return
     if text == "/stats":
@@ -847,20 +958,10 @@ def handle_message(msg):
 
     send(chat_id, "متوجه نشدم. /start بزن.")
 
+
 # ═══════════════════════════════════════════════════════════════
 # CALLBACK HANDLER
 # ═══════════════════════════════════════════════════════════════
-def stats_text():
-    s = stats()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    ch = channels()
-    on = sum(1 for c in ch.values() if c.get("enabled", True))
-    return (f"<b>📊 آمار</b>\n\n"
-            f"کل ارسال‌ها: <b>{s.get('total', 0)}</b>\n"
-            f"امروز: <b>{s.get('today', {}).get(today, 0)}</b>\n"
-            f"کانال‌ها: <b>{len(ch)}</b> (فعال: {on})\n"
-            f"آخرین ارسال: <code>{s.get('last') or '—'}</code>")
-
 def handle_callback(cb):
     uid = cb.get("from", {}).get("id")
     chat_id = cb["message"]["chat"]["id"]
@@ -871,7 +972,7 @@ def handle_callback(cb):
         answer_cb(cb["id"], "⛔️ ادمین نیستید.", alert=True); return
 
     answer_cb(cb["id"])
-    now_str = datetime.utcnow().strftime("%H:%M:%S")
+    now_str = datetime.now(TEHRAN).strftime("%H:%M:%S")
     edit(chat_id, msg_id, f"⏳ {now_str}", None)
 
     # ── Main menu ──────────────────────────────────────────
@@ -906,7 +1007,7 @@ def handle_callback(cb):
              f"ربات: {'🟢' if cfg.get('global_enabled') else '🔴'}\n"
              f"کانال‌های فعال: <b>{on}/{len(ch)}</b>\n"
              f"کل ارسال: <b>{stats().get('total', 0)}</b>\n"
-             f"زمان: <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>",
+             f"زمان تهران: <code>{datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')}</code>",
              KB([B("⬅️ منو", "m:main")])); return
 
     # ── Channels ───────────────────────────────────────────
@@ -927,16 +1028,18 @@ def handle_callback(cb):
         edit(chat_id, msg_id,
              "<b>➕ افزودن کانال</b>\n\n"
              "۱) ربات رو ادمین کانال کن (با اجازهٔ ارسال)\n"
-             "۲) از کانال یه پیام <b>فوروارد</b> کن\n\n"
+             "۲) از کانال یه پیام <b>فوروارد</b> کن (نه از چت، از خود کانال)\n\n"
+             "اگه فوروارد کار نکرد، از «افزودن دسته‌ای» استفاده کن و آیدی رو دستی بفرست.\n\n"
              "منتظر فوروارد هستم...",
-             KB([B("❌ لغو", "m:ch")]))
+             KB([B("📦 افزودن دستی", "ch:bulk"),
+                 B("❌ لغو", "m:ch")]))
         return
 
     if data == "ch:bulk":
         PENDING[uid] = {"action": "bulk_channels"}
         edit(chat_id, msg_id,
              "<b>📦 افزودن دسته‌ای کانال</b>\n\n"
-             "لیست رو این‌طوری بفرست (هر خط یا کاما جدا):\n"
+             "هر خط یا کاما جدا:\n"
              "<code>-1001234567890:عنوان کانال</code>\n"
              "<code>@my_channel:کانال دوم</code>\n\n"
              "برای گرفتن ID از @userinfobot یا @getidsbot استفاده کن.",
@@ -977,7 +1080,7 @@ def handle_callback(cb):
         if action == "times":
             PENDING[uid] = {"action": "set_times", "data": {"cid": cid}}
             edit(chat_id, msg_id,
-                 "<b>⏰ تنظیم ساعت‌ها</b>\n\n"
+                 "<b>⏰ تنظیم ساعت‌ها (به وقت تهران)</b>\n\n"
                  "با کاما جدا کن:\n<code>09:00, 12:30, 18:00, 21:00</code>",
                  KB([B("❌ لغو", f"ch:{cid}")]))
             return
@@ -1010,7 +1113,7 @@ def handle_callback(cb):
             cat = random.choice(info.get("categories") or config()["default_cats"])
             edit(chat_id, msg_id, "⏳ در حال ارسال تست...")
             ok, mode, mid = publish(
-                int(cid), cat,
+                cid, cat,
                 with_image=info.get("with_image", True),
                 hashtag=info.get("with_hashtag", True),
                 channel_title=info.get("title", ""),
@@ -1034,7 +1137,7 @@ def handle_callback(cb):
     # ── Schedule overview ──────────────────────────────────
     if data == "m:sched":
         ch = channels()
-        lines = ["<b>⏰ زمان‌بندی کلی</b>", ""]
+        lines = ["<b>⏰ زمان‌بندی کلی (به وقت تهران)</b>", ""]
         for cid, info in ch.items():
             times = ", ".join(info.get("times", [])) or "—"
             lines.append(f"• <b>{info.get('title', cid)[:25]}</b>\n  <code>{times}</code>")
@@ -1119,7 +1222,6 @@ def handle_callback(cb):
 
     if data.startswith("nwsend:"):
         cid = data.split(":", 1)[1]
-        # pick a random feed
         key = random.choice(list(RSS_FEEDS.keys()))
         items = fetch_rss(key, limit=5)
         if not items:
@@ -1130,7 +1232,7 @@ def handle_callback(cb):
         for it in items:
             lines.append(f"• <a href=\"{it['link']}\">{it['title'][:130]}</a>")
         text = "\n".join(lines)
-        r = send(int(cid), text)
+        r = send(to_chat_id(cid), text)
         if r.get("ok"):
             bump_stats()
             log_event("news_send", f"{cid} {key}")
@@ -1309,7 +1411,6 @@ def handle_callback(cb):
         return
 
     if data == "t:uuid":
-        import uuid
         edit(chat_id, msg_id, f"🔐 <code>{uuid.uuid4()}</code>",
              KB([B("🔄", "t:uuid"), B("⬅️", "m:tools")]))
         return
@@ -1323,8 +1424,8 @@ def handle_callback(cb):
 
     if data == "t:time":
         edit(chat_id, msg_id,
-             f"📅 محلی: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-             f"UTC: <code>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}</code>",
+             f"📅 تهران: <code>{datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+             f"UTC: <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}</code>",
              KB([B("🔄", "t:time"), B("⬅️", "m:tools")]))
         return
 
@@ -1424,7 +1525,6 @@ def handle_callback(cb):
         return
 
     if data == "t:weather":
-        # Simple weather via wttr.in
         try:
             req = urllib.request.Request("https://wttr.in/Tehran?format=%C+%t+%w",
                                          headers={"User-Agent":"curl/7.0"})
@@ -1442,7 +1542,6 @@ def handle_callback(cb):
         return
 
     if data == "bk:download":
-        # Send a JSON dump as a document-ish text
         blob = {
             "channels": channels(),
             "config":   config(),
@@ -1450,24 +1549,35 @@ def handle_callback(cb):
             "topics":   topics_store(),
             "templates":templates(),
             "drafts":   drafts(),
-            "exported_at": datetime.utcnow().isoformat(),
+            "exported_at": datetime.now(TEHRAN).isoformat(),
         }
-        text = json.dumps(blob, ensure_ascii=False, indent=2)
-        # Send as text (chunked if too long)
-        edit(chat_id, msg_id,
-             f"<b>💾 بکاپ کامل</b>\n\n<code>{text[:3500]}</code>\n\n"
-             f"(در صورت طولانی بودن، از فایل داده روی سرور استفاده کن: <code>{DATA_DIR}</code>)",
-             KB([B("⬅️", "m:backup")]))
+        data_bytes = json.dumps(blob, ensure_ascii=False, indent=2).encode("utf-8")
+        r = send_document_bytes(chat_id,
+                                f"mahan_backup_{int(time.time())}.json",
+                                data_bytes,
+                                caption="💾 بکاپ کامل",
+                                kb=KB([B("⬅️", "m:backup")]))
+        if not r.get("ok"):
+            # fallback: send as text
+            text = json.dumps(blob, ensure_ascii=False, indent=2)
+            edit(chat_id, msg_id,
+                 f"<b>💾 بکاپ</b>\n\n<code>{text[:3500]}</code>",
+                 KB([B("⬅️", "m:backup")]))
         return
 
     if data in ("bk:channels", "bk:topics", "bk:stats"):
         what = data.split(":")[1]
         d = {"channels": channels(), "topics": topics_store(),
              "stats": stats()}[what]
-        text = json.dumps(d, ensure_ascii=False, indent=2)
-        edit(chat_id, msg_id,
-             f"<b>📤 {what}</b>\n\n<code>{text[:3500]}</code>",
-             KB([B("⬅️", "m:backup")]))
+        data_bytes = json.dumps(d, ensure_ascii=False, indent=2).encode("utf-8")
+        r = send_document_bytes(chat_id, f"{what}_{int(time.time())}.json",
+                                data_bytes, caption=f"📤 {what}",
+                                kb=KB([B("⬅️", "m:backup")]))
+        if not r.get("ok"):
+            text = json.dumps(d, ensure_ascii=False, indent=2)
+            edit(chat_id, msg_id,
+                 f"<b>📤 {what}</b>\n\n<code>{text[:3500]}</code>",
+                 KB([B("⬅️", "m:backup")]))
         return
 
     if data == "bk:reset":
@@ -1480,20 +1590,28 @@ def handle_callback(cb):
 
     # ── Test ───────────────────────────────────────────────
     if data == "m:test":
-        tests = [
-            ("storage", lambda: (put(F_STATE, state()), True)[1]),
-            ("topics",  lambda: len(topics_store()) > 0),
-            ("channels",lambda: True),
-            ("rss",     lambda: fetch_rss("hn", 1) is not None),
-            ("http",    lambda: True),
-        ]
         results = []
-        for name, fn in tests:
-            try:
-                results.append(f"✅ {name}")
-                fn()
-            except Exception as e:
-                results.append(f"❌ {name}: {e}")
+        try:
+            put(F_STATE, state()); results.append("✅ storage")
+        except Exception as e:
+            results.append(f"❌ storage: {e}")
+        try:
+            results.append(f"✅ topics ({len(topics_store())})")
+        except Exception as e:
+            results.append(f"❌ topics: {e}")
+        try:
+            results.append(f"✅ channels ({len(channels())})")
+        except Exception as e:
+            results.append(f"❌ channels: {e}")
+        try:
+            r = fetch_rss("hn", 1)
+            results.append("✅ rss" if r is not None else "❌ rss")
+        except Exception as e:
+            results.append(f"❌ rss: {e}")
+        try:
+            results.append("✅ tz " + datetime.now(TEHRAN).strftime("%H:%M"))
+        except Exception as e:
+            results.append(f"❌ tz: {e}")
         edit(chat_id, msg_id,
              "<b>🧪 تست سیستم</b>\n\n" + "\n".join(results),
              KB([B("🔄 دوباره", "m:test"), B("⬅️ منو", "m:main")]))
@@ -1501,6 +1619,7 @@ def handle_callback(cb):
 
     # fallback
     edit(chat_id, msg_id, "گزینه نامعتبر.", main_menu())
+
 
 # ═══════════════════════════════════════════════════════════════
 # POLL LOOP
@@ -1512,6 +1631,7 @@ def set_commands():
         {"command": "help",  "description": "راهنما"},
         {"command": "id",    "description": "آیدی من"},
     ]})
+
 
 def poll_loop():
     print("[poll] started")
@@ -1536,12 +1656,13 @@ def poll_loop():
             log_event("poll_loop_err", e)
             time.sleep(3)
 
+
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 def main():
     print("=" * 60)
-    print(" MAHAN NEMAN BOT — Professional Edition")
+    print(" MAHAN NEMAN BOT — Professional Edition (Fixed)")
     print("=" * 60)
     ensure_topics()
     me = api("getMe")
@@ -1550,11 +1671,13 @@ def main():
     print("Bot:", me["result"]["username"], f"(id={me['result']['id']})")
     print("Admins:", ADMIN_IDS)
     print("Data dir:", DATA_DIR.resolve())
+    print("TZ: Tehran (UTC+3:30)")
     set_commands()
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     poll_loop()
+
 
 if __name__ == "__main__":
     try: main()
