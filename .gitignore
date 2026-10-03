@@ -1,6 +1,4 @@
-
-node_modules/
+data/
+__pycache__/
+*.pyc
 .env
-*.log
-seen.json
-agent.log
